@@ -1,0 +1,2 @@
+python scripts/get_offset.py --start-joints 0 0 0 -1.57 0 1.57 -0.785 --joint-signs 1 -1 1 1 1 1 1 --port /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAJO92F-if00-port0 
+
