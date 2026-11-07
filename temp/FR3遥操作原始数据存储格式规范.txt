@@ -1,0 +1,118 @@
+FR3 遥操作原始数据存储格式规范
+====================================
+一、设计目标
+------------
+相互独立地记录机器人原始状态、最终下发命令和相机视频，以便后续按真实时间戳同步、重采样并导出 LeRobot v3 / OpenWAM 训练数据。
+
+二、目录结构
+----------------
+data/raw/task_name/
+├── dataset_metadata.json         # 任务级配置、采集版本
+├── manifest.csv                  # 原始记录索引及任务信息
+├── episode_000000/
+│   ├── metadata.json             # 本条任务、时间、标定、统计信息
+│   ├── robot.hdf5                # 机器人状态、命令和时间戳
+│   ├── head_camera/
+│   │   ├── color.mp4             # 640×480、目标 30 FPS
+│   │   └── frames.jsonl          # 逐帧时间戳与帧编号
+│   └── left_wrist_camera/
+│       ├── color.mp4
+│       └── frames.jsonl
+└── episode_000001/ ...
+
+三、采集频率与时间戳
+--------------------
+1. FR3 实测状态和FR3 最终下发命令：目标 100 Hz。
+FR3 实测状态与最终下发命令统一在目标 100 Hz 的控制循环中记录，每个控制周期采集一次实测状态，并记录该周期实际提交的控制命令。两者通过 control_cycle_id 一一关联，同时分别保存真实时间戳。发生读取失败、命令发送失败或周期丢失时，保留异常标记，不伪造数据
+2. 两路 D435i RGB 视频：640×480、目标 30 FPS。
+3. 机器人与相机统一记录同一主机的 time.monotonic_ns() 时间戳；设备原生时间戳及其时钟域如可获取，也一并保留。
+4. 每条机器人记录用 control_cycle_id 对应同周期实测状态和命令。observation_ns 是状态获取时刻，command_ns 是命令实际提交时刻，二者不要求相等。
+
+四、robot.hdf5 字段（N 为控制周期数）
+------------------------------------
+/timestamps/
+  control_cycle_id       (N,)    int64    周期编号
+  observation_ns         (N,)    int64    主机状态采集时间戳，ns
+  command_ns             (N,)    int64    主机命令提交时间戳，ns
+
+/observations/
+  joint_positions        (N,7)   float64  实测关节位置，rad
+  joint_velocities       (N,7)   float64  实测关节速度，rad/s
+  eef_pose               (N,7)   float64  实测 EEF [x,y,z,qx,qy,qz,qw]，m+四元数
+  eef_pose_6d            (N,9)   float64  [x,y,z,rot6d(6)]
+  gripper_state          (N,G)   float64  实测夹爪值；G 与单位按真实接口定义
+
+/actions/
+  target_joint_positions (N,7)   float64  最终下发 FR3 的关节目标，rad
+  target_eef_pose        (N,7)   float64  目标关节经 FK 得到的 EEF 位姿
+  target_eef_pose_6d     (N,9)   float64  目标 EEF [x,y,z,rot6d(6)]
+  target_gripper         (N,1)   float64  实际下发夹爪命令，语义需说明
+
+/diagnostics/
+  observation_valid      (N,)    bool     实测状态是否有效
+  command_valid          (N,)    bool     命令是否有效
+  command_status         (N,)    uint8    0 未发送；1 已提交接口；2 接口报错；3 未知
+
+重要说明：
+- target_joint_positions 必须来源于 GELLO 映射、校准、限幅之后真正提交给 FR3 的控制目标，不可直接存 GELLO 原始读数。
+- target_eef_pose = FK(target_joint_positions)，使用一致的 FR3 模型、关节顺序和 EEF 工具坐标系。EEF 位姿及 rot6d 是可重新计算的派生字段；原始关节状态和最终命令才是首要事实记录。
+- 实测 EEF 与目标 EEF 不可混用；命令已提交也不代表机器人已执行到位。
+- 如果数据丢失，应保留行号、有效性标志和明确的缺失标记，不静默拿前值填充原始记录。
+
+五、相机视频和逐帧索引
+----------------------
+每台相机：
+  color.mp4     640×480 RGB8 采集的视频，可采用 H.264 无损编码（需验证实际编码与解码的像素一致性）。
+  frames.jsonl  每成功写入视频的一帧对应一行 JSON。
+
+frames.jsonl 示例：
+{"frame_index":0,"host_timestamp_ns":1000000000,"device_timestamp":123456.7,"device_timestamp_unit":"ms","device_clock_domain":"hardware_clock","frame_number":100,"valid":true}
+
+字段：frame_index（视频中的帧索引，连续）；host_timestamp_ns（主机收到帧的时间）；device_timestamp、device_timestamp_unit、device_clock_domain（设备原生时钟信息）；frame_number（设备帧序号，可跳号）；valid（有效性）
+相机同步以主机逐帧时间戳为基础。
+
+六、metadata.json / manifest.csv
+--------------------------------
+metadata.json 建议包含：
+- schema_version、episode_id、task_id、prompt、采集起止时间；
+- 机器人型号、关节顺序、控制器类型、EEF 坐标系、四元数顺序、rot6d 约定、FK 模型版本；
+- 夹爪实测状态单位及命令表示方式；
+- 相机序列号、分辨率、标称 FPS、相机内外参和标定版本；
+- GELLO→FR3 映射、零点校准、限幅配置版本；软件版本；
+- 实际控制记录数、两路视频帧数、丢帧/异常统计；
+- operator_success（操作者是否认为任务成功）。
+
+manifest.csv 保留现有流程字段：
+task_id, planned_episode_id, planned_order, planned_export_episode_index,
+raw_episode_id, raw_path, session_id, operator_id,
+third_person_camera_serial, wrist_camera_serial, prompt, success,
+acceptance_status, rejection_reason, accepted_episode_id, split
+
+说明：验收相关字段仅为兼容旧清单保留。操作者标记成功且原始数据完整后可直接导出；导出器仍会检查数据一致性。
+
+七、后处理与训练导出
+--------------------
+1. 模块 A 原始采集：只记录真实时间戳、机器人状态/命令与两路视频；尽量异步写盘，避免阻塞机器人控制。
+2. 模块 B 数据处理：统一时间轴，按需转换为 30 Hz（也可重新导出为 15 Hz 等）。
+3. observation.state 从实测机器人状态按有效时间戳选取/插值。
+4. action 从实际下发命令生成；关节位置目标等保持型命令优先按语义使用零阶保持（ZOH），不无条件线性插值。
+5. 目标 EEF 优先在目标关节命令选定后重新做 FK；RGB 图像选取时间最近的有效帧。
+6. OpenWAM EEF10 Action：[x,y,z,rot6d(6),gripper(1)]，共 10 维；夹爪范围和归一化规则在导出器中确定。
+
+八、质量检查重点
+----------------
+- 机器人状态/命令缺失、有效性标记和控制周期匹配；
+- Observation 与 Command 的时间差分布；
+- 关节限位、FK 一致性和异常跳变；
+- 两路相机与机器人时间对齐误差、掉帧及过长保持；
+- LeRobot v3 导出结果可读取，OpenWAM dataloader 能解析双相机和 EEF10。
+
+九、落地前需要核对的接口事实
+--------------------------
+1. FR3 状态接口返回的是实时状态还是缓存状态，以及设备时间戳是否可用。
+2. 实际发送关节目标的位置和命令确认语义。
+3. 夹爪状态/命令单位、维度与开合定义。
+4. FR3 FK 的基坐标系、工具坐标系、四元数及 rot6d 排列约定。
+5. 两路 RealSense 是否由同一台主机打时间戳，以及视频编码是否真正无损。
+
+结论：原始层推荐独立记录目录、机器人数据文件、双路视频与逐帧时间信息、元数据文件，并用 manifest.csv 管理任务和原始记录。高频原始数据与训练阶段的表示保持独立。
