@@ -1,0 +1,6 @@
+numpy>=1.20
+Pillow>=9
+websockets>=12
+pyrealsense2
+h5py>=3
+pyarrow>=10
